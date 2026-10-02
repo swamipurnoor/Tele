@@ -47,9 +47,9 @@ jobs:
           # The repo is public, so the run log is public too: only counters are
           # printed (no file names / topic names). Full log goes to the
           # encrypted artifact below.
-          timeout -s INT -k 180 5h30m python -u copier.py run --prefetch 1 2>&1 \
+          timeout -s INT -k 180 330m python -u copier.py run --prefetch 1 2>&1 \
             | tee copier.out \
-            | grep --line-buffered -E 'STATUS|FINISHED|Left to copy|Target holds|FATAL'
+            | grep --line-buffered -E 'STATUS|FINISHED|Left to copy|Target holds|FATAL|STOPPED|not set'
           code=${PIPESTATUS[0]}
           echo "copier exit code: $code"
           if [ "$code" = 124 ] || [ "$code" = 137 ]; then
@@ -59,7 +59,11 @@ jobs:
             echo "Everything is copied."
             echo "done=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::Copier stopped without finishing (exit $code). Open the logs artifact."
+            echo "::error::Copier stopped without finishing (exit $code)."
+            if ! grep -q 'Starting\.' copier.out; then
+              echo "It failed before copying started. Last output:"
+              tail -n 15 copier.out
+            fi
             exit 1
           fi
 
@@ -70,7 +74,7 @@ jobs:
         run: |
           mkdir -p out
           if [ -n "$LOG_PASSPHRASE" ]; then
-            files=$(ls copier.log failed.log skipped.log 2>/dev/null)
+            files=$(ls copier.log failed.log skipped.log 2>/dev/null || true)
             [ -n "$files" ] && tar czf - $files | gpg --batch --yes --pinentry-mode loopback \
               --symmetric --cipher-algo AES256 --passphrase "$LOG_PASSPHRASE" -o out/logs.tar.gz.gpg
           fi
