@@ -1,0 +1,105 @@
+name: telegram-copier
+
+on:
+  workflow_dispatch:          # the "Run workflow" button: start / restart
+  schedule:
+    - cron: "11 */6 * * *"    # safety net: restarts the chain if it ever breaks
+
+# Never two runs at once: the same Telegram login on two machines gets revoked.
+concurrency:
+  group: telegram-copier
+  cancel-in-progress: false
+
+permissions:
+  actions: write              # lets the run start its successor / disable itself
+  contents: read
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355      # GitHub's hard limit is 360 per job
+    outputs:
+      again: ${{ steps.run.outputs.again }}
+      done: ${{ steps.run.outputs.done }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Copy until just before the 6 hour limit
+        id: run
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_SOURCE: ${{ secrets.TG_SOURCE }}
+          TG_TARGET: ${{ secrets.TG_TARGET }}
+          TG_FROM: ${{ secrets.TG_FROM }}
+          TG_TO: ${{ secrets.TG_TO }}
+        run: |
+          set +e
+          df -h . | tail -1
+          # The repo is public, so the run log is public too: only counters are
+          # printed (no file names / topic names). Full log goes to the
+          # encrypted artifact below.
+          timeout -s INT -k 180 5h30m python -u copier.py run --prefetch 1 2>&1 \
+            | tee copier.out \
+            | grep --line-buffered -E 'STATUS|FINISHED|Left to copy|Target holds|FATAL'
+          code=${PIPESTATUS[0]}
+          echo "copier exit code: $code"
+          if [ "$code" = 124 ] || [ "$code" = 137 ]; then
+            echo "Time slice used up - starting the next run."
+            echo "again=true" >> "$GITHUB_OUTPUT"
+          elif grep -q 'FINISHED\.' copier.out; then
+            echo "Everything is copied."
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Copier stopped without finishing (exit $code). Open the logs artifact."
+            exit 1
+          fi
+
+      - name: Encrypt logs
+        if: always()
+        env:
+          LOG_PASSPHRASE: ${{ secrets.LOG_PASSPHRASE }}
+        run: |
+          mkdir -p out
+          if [ -n "$LOG_PASSPHRASE" ]; then
+            files=$(ls copier.log failed.log skipped.log 2>/dev/null)
+            [ -n "$files" ] && tar czf - $files | gpg --batch --yes --pinentry-mode loopback \
+              --symmetric --cipher-algo AES256 --passphrase "$LOG_PASSPHRASE" -o out/logs.tar.gz.gpg
+          fi
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.run_number }}
+          path: out
+          retention-days: 30
+          if-no-files-found: ignore
+
+  next:
+    needs: copy
+    if: needs.copy.outputs.again == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run copier.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
+
+  finish:
+    needs: copy
+    if: needs.copy.outputs.done == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable the workflow (job done, stops the schedule)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable copier.yml --repo "${{ github.repository }}"

@@ -1,0 +1,7 @@
+*.session
+*.session-journal
+progress.json
+downloads/
+*.log
+copier.out
+out/
